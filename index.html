@@ -1,0 +1,1076 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kanban Board</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', 'Segoe UI', sans-serif; background: #fff; color: #111; }
+    @keyframes spin      { to { transform: rotate(360deg); } }
+    @keyframes slideDown { from { opacity:0; transform:translateY(-16px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes fadeIn    { from { opacity:0; transform:translateX(-50%) translateY(8px); } to { opacity:1; transform:translateX(-50%) translateY(0); } }
+    input, textarea, select, button { font-family: inherit; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #f9fafb; }
+    ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ── Constants ── */
+const COLUMNS = [
+  { id: "todo",       label: "To Do",       accent: "#ef4444" },
+  { id: "inprogress", label: "In Progress",  accent: "#f59e0b", wipLimit: 5 },
+  { id: "done",       label: "Done",         accent: "#d1d5db" },
+];
+const PRIORITIES    = ["low", "medium", "high"];
+const pAccent       = { low: "#d1d5db", medium: "#f59e0b", high: "#ef4444" };
+const pLabel        = { low: "Low", medium: "Medium", high: "High" };
+const STORAGE_KEY   = "kanban-tasks-v3";
+const SETTINGS_KEY  = "kanban-settings-v1";
+const NOTIFIED_KEY  = "kanban-notified-";
+const emptyForm     = { title: "", description: "", priority: "medium", column: "todo", deadline: "" };
+const emptySettings = { name: "", email: "", notifyDayBefore: true, notifyOnDay: true, notifGranted: false };
+
+/* ── Storage ── */
+const lsGet = k => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+
+/* ── Utils ── */
+function deadlineStatus(dl) {
+  if (!dl) return null;
+  const now = new Date(); now.setHours(0,0,0,0);
+  const d   = new Date(dl + "T00:00:00");
+  const diff = Math.round((d - now) / 86400000);
+  if (diff < 0)   return { label: `Expirat (${fmt(dl)})`, color: "#ef4444", urgent: true,  diff };
+  if (diff === 0) return { label: "Azi",                   color: "#ef4444", urgent: true,  diff };
+  if (diff === 1) return { label: "Mâine",                 color: "#d97706", urgent: true,  diff };
+  if (diff <= 3)  return { label: `${diff} zile · ${fmt(dl)}`, color: "#d97706", urgent: false, diff };
+  return { label: fmt(dl), color: "#9ca3af", urgent: false, diff };
+}
+const fmt   = dl => new Date(dl + "T00:00:00").toLocaleDateString("ro-RO", { day: "numeric", month: "short" });
+const fmtTs = ts => { const d = new Date(ts); return d.toLocaleDateString("ro-RO", { day: "numeric", month: "short" }) + " · " + d.toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" }); };
+const dlSort = dl => dl ? new Date(dl).getTime() : Infinity;
+const makeEv = (type, data = {}) => ({ id: Date.now().toString() + Math.random(), type, ts: new Date().toISOString(), ...data });
+
+function parseSubtasks(desc) {
+  if (!desc) return [];
+  return desc.split("\n").map((line, i) => {
+    const m = line.match(/^- \[([ x])\] (.+)/);
+    return m ? { index: i, checked: m[1] === "x", text: m[2] } : null;
+  }).filter(Boolean);
+}
+function toggleSubtask(desc, idx) {
+  const lines = desc.split("\n");
+  lines[idx] = lines[idx].replace(/^- \[([ x])\]/, (_, c) => `- [${c === " " ? "x" : " "}]`);
+  return lines.join("\n");
+}
+function parseInline(text) {
+  const out = []; let rem = text, k = 0;
+  const rules = [
+    [/^\*\*(.+?)\*\*/, m => <strong key={k++} style={{fontWeight:600}}>{m[1]}</strong>],
+    [/^\*(.+?)\*/,     m => <em     key={k++} style={{fontStyle:"italic"}}>{m[1]}</em>],
+    [/^~~(.+?)~~/,     m => <s      key={k++}>{m[1]}</s>],
+    [/^`(.+?)`/,       m => <code   key={k++} style={{background:"#f3f4f6",padding:"1px 4px",fontSize:11,fontFamily:"monospace",borderRadius:2}}>{m[1]}</code>],
+  ];
+  while (rem.length) {
+    let hit = false;
+    for (const [re, fn] of rules) { const m = rem.match(re); if (m) { out.push(fn(m)); rem = rem.slice(m[0].length); hit = true; break; } }
+    if (!hit) { const nx = rem.search(/[\*~`]/); if (nx <= 0) { out.push(<span key={k++}>{nx === 0 ? rem[0] : rem}</span>); rem = nx === 0 ? rem.slice(1) : ""; } else { out.push(<span key={k++}>{rem.slice(0,nx)}</span>); rem = rem.slice(nx); } }
+  }
+  return out;
+}
+const renderNote = text => text ? text.split("\n").map((l,i) => <span key={i}>{i>0&&<br/>}{parseInline(l)}</span>) : null;
+
+/* ── Notifications ── */
+async function requestNotifPermission() {
+  if (!("Notification" in window)) return false;
+  if (Notification.permission === "granted") return true;
+  return (await Notification.requestPermission()) === "granted";
+}
+function showBrowserNotif(title, body, tag) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const n = new Notification(title, { body, tag, icon: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23111'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='%23fff'%3E📋%3C/text%3E%3C/svg%3E" });
+  n.onclick = () => window.focus();
+}
+function buildMailto(email, tasks, name) {
+  const subj    = encodeURIComponent(`⚠️ Reminder Kanban — ${tasks.length} task${tasks.length>1?"uri":""} scadente`);
+  const greeting = name ? `Salut ${name},\n\n` : "";
+  const lines    = tasks.map(t => { const dl = deadlineStatus(t.deadline); return `• ${t.title} — ${dl?.diff===0?"AZI":"MÂINE"} (${fmt(t.deadline)}) [${pLabel[t.priority]}]`; });
+  const body     = encodeURIComponent(`${greeting}Ai ${tasks.length} task${tasks.length>1?"uri":""} cu deadline iminent:\n\n${lines.join("\n")}\n\n— Kanban Board`);
+  return `mailto:${email}?subject=${subj}&body=${body}`;
+}
+
+/* ══════════════════════════════
+   APP
+══════════════════════════════ */
+function App() {
+  const [tasks,        setTasks]        = useState([]);
+  const [settings,     setSettings]     = useState(emptySettings);
+  const [loaded,       setLoaded]       = useState(false);
+  const [activeTab,    setActiveTab]    = useState("board");
+  const [searchQuery,  setSearchQuery]  = useState("");
+  const [filterPri,    setFilterPri]    = useState(null);
+  const [modal,        setModal]        = useState(false);
+  const [editing,      setEditing]      = useState(null);
+  const [form,         setForm]         = useState(emptyForm);
+  const [dragging,     setDragging]     = useState(null);
+  const [dragOver,     setDragOver]     = useState(null);
+  const [sortDL,       setSortDL]       = useState(false);
+  const [toast,        setToast]        = useState(null);
+  const [showImport,   setShowImport]   = useState(false);
+  const [showExport,   setShowExport]   = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [notifBanner,  setNotifBanner]  = useState(null);
+
+  useEffect(() => {
+    const t = lsGet(STORAGE_KEY);  if (t) setTasks(t);
+    const s = lsGet(SETTINGS_KEY); if (s) setSettings(p => ({ ...p, ...s }));
+    setLoaded(true);
+  }, []);
+  useEffect(() => { if (loaded) lsSet(STORAGE_KEY,  tasks);    }, [tasks, loaded]);
+  useEffect(() => { if (loaded) lsSet(SETTINGS_KEY, settings); }, [settings, loaded]);
+
+  const checkAndNotify = useCallback((taskList, cfg, forceShow = false) => {
+    if (!taskList.length) return;
+    const todayStr = new Date().toISOString().split("T")[0];
+    const urgent = taskList.filter(t => {
+      if (t.column === "done" || !t.deadline || t.archived) return false;
+      const dl = deadlineStatus(t.deadline);
+      return (dl?.diff === 0 && cfg.notifyOnDay) || (dl?.diff === 1 && cfg.notifyDayBefore);
+    });
+    if (!urgent.length) return;
+    setNotifBanner({ tasks: urgent });
+    if (forceShow) return;
+    const notifiedToday = lsGet(NOTIFIED_KEY + todayStr) || {};
+    const newOnes = urgent.filter(t => !notifiedToday[t.id]);
+    if (!newOnes.length) return;
+    const updated = { ...notifiedToday };
+    newOnes.forEach(t => { updated[t.id] = true; });
+    lsSet(NOTIFIED_KEY + todayStr, updated);
+    if (cfg.notifGranted && Notification.permission === "granted") {
+      newOnes.length === 1
+        ? showBrowserNotif(`⚠️ Task scadent ${deadlineStatus(newOnes[0].deadline)?.diff===0?"AZI":"MÂINE"}`, newOnes[0].title, "kanban-"+newOnes[0].id)
+        : showBrowserNotif(`⚠️ ${newOnes.length} taskuri scadente`, newOnes.map(t=>t.title).join(", "), "kanban-multi");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!loaded || !tasks.length) return;
+    checkAndNotify(tasks, settings);
+    const iv = setInterval(() => checkAndNotify(tasks, settings), 60*60*1000);
+    return () => clearInterval(iv);
+  }, [loaded, tasks, settings, checkAndNotify]);
+
+  useEffect(() => {
+    const h = e => {
+      if (["INPUT","TEXTAREA","SELECT"].includes(e.target.tagName)) return;
+      if ((e.key==="n"||e.key==="N") && !modal && !showImport && !showSettings) { e.preventDefault(); openAdd(); }
+      if (e.key==="Escape") { setModal(false); setShowImport(false); setShowSettings(false); setShowExport(false); }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [modal, showImport, showSettings, showExport]);
+
+  const openAdd  = (col="todo") => { setEditing(null); setForm({...emptyForm,column:col}); setModal(true); };
+  const openEdit = task => { setEditing(task); setForm({title:task.title,description:task.description,priority:task.priority,column:task.column,deadline:task.deadline||""}); setModal(true); };
+
+  const save = () => {
+    if (!form.title.trim()) return;
+    if (editing) {
+      setTasks(t => t.map(x => {
+        if (x.id !== editing.id) return x;
+        const act = [...(x.activity||[])];
+        if (form.column   !== x.column)          act.push(makeEv("moved",   { from: COLUMNS.find(c=>c.id===x.column)?.label,   to: COLUMNS.find(c=>c.id===form.column)?.label }));
+        if (form.priority !== x.priority)        act.push(makeEv("changed", { field:"Prioritate", from:pLabel[x.priority], to:pLabel[form.priority] }));
+        if (form.deadline !== (x.deadline||""))  act.push(makeEv("changed", { field:"Deadline",   from:x.deadline?fmt(x.deadline):"—", to:form.deadline?fmt(form.deadline):"—" }));
+        if (form.title    !== x.title)           act.push(makeEv("changed", { field:"Titlu",       from:x.title, to:form.title }));
+        if (form.description!==x.description)   act.push(makeEv("changed", { field:"Descriere",   from:null, to:null }));
+        return {...x,...form,activity:act};
+      }));
+    } else {
+      setTasks(t => [...t, {id:Date.now().toString(),...form,createdAt:new Date().toISOString(),activity:[makeEv("created")]}]);
+    }
+    setModal(false);
+  };
+
+  const addNote = (taskId, text) => {
+    if (!text.trim()) return;
+    setTasks(t => t.map(x => x.id!==taskId?x:{...x,activity:[...(x.activity||[]),makeEv("note",{text})]}));
+  };
+  const del = id => {
+    const task = tasks.find(t=>t.id===id); if (!task) return;
+    if (toast) clearTimeout(toast.timeoutId);
+    const timeoutId = setTimeout(()=>setToast(null), 5000);
+    setTasks(t=>t.filter(x=>x.id!==id)); setToast({task,timeoutId});
+  };
+  const undoDelete = () => { if (!toast) return; clearTimeout(toast.timeoutId); setTasks(t=>[...t,toast.task]); setToast(null); };
+  const move = (id, col) => setTasks(t=>t.map(x=>x.id!==id?x:{...x,column:col,activity:[...(x.activity||[]),makeEv("moved",{from:COLUMNS.find(c=>c.id===x.column)?.label,to:COLUMNS.find(c=>c.id===col)?.label})]}));
+  const archiveTask   = id => setTasks(t=>t.map(x=>x.id!==id?x:{...x,archived:true,  archivedAt:new Date().toISOString(),activity:[...(x.activity||[]),makeEv("archived")]}));
+  const unarchiveTask = id => setTasks(t=>t.map(x=>x.id!==id?x:{...x,archived:false, archivedAt:null,activity:[...(x.activity||[]),makeEv("unarchived")]}));
+  const toggleSubtaskCard = (taskId,li) => setTasks(t=>t.map(x=>x.id!==taskId?x:{...x,description:toggleSubtask(x.description,li)}));
+  const importTasks = newTasks => setTasks(t=>[...t,...newTasks]);
+
+  const filterTask = t => {
+    if (t.archived) return false;
+    if (searchQuery) { const q=searchQuery.toLowerCase(); if (!t.title.toLowerCase().includes(q) && !(t.description||"").toLowerCase().includes(q)) return false; }
+    if (filterPri && t.priority !== filterPri) return false;
+    return true;
+  };
+  const byCol = col => {
+    let list = tasks.filter(t => t.column===col && filterTask(t));
+    if (sortDL) list = [...list].sort((a,b) => dlSort(a.deadline)-dlSort(b.deadline));
+    return list;
+  };
+
+  const activeTasks   = tasks.filter(t => !t.archived);
+  const archivedTasks = tasks.filter(t =>  t.archived);
+  const dueSoon = activeTasks.filter(t => t.column!=="done" && t.deadline && deadlineStatus(t.deadline)?.urgent).length;
+  const total   = activeTasks.length;
+  const done    = activeTasks.filter(t => t.column==="done").length;
+  const notifOk = settings.notifGranted && ("Notification" in window) && Notification.permission==="granted";
+  const hasFilters = searchQuery || filterPri || sortDL;
+
+  if (!loaded) return <div style={{height:"100vh",display:"flex",alignItems:"center",justifyContent:"center",color:"#9ca3af",fontSize:13}}>Se încarcă...</div>;
+
+  return (
+    <div style={{minHeight:"100vh",background:"#fff"}}>
+      {/* ── HEADER ── */}
+      <div style={{borderBottom:"1.5px solid #111",position:"sticky",top:0,background:"#fff",zIndex:100}}>
+        <div style={{maxWidth:1280,margin:"0 auto",padding:"16px 32px 0"}}>
+          {/* Top row */}
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",paddingBottom:12,flexWrap:"wrap",gap:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+              <h1 style={{margin:0,fontSize:20,fontWeight:500,letterSpacing:"-0.3px"}}>My Board</h1>
+              {total>0 && (
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{width:80,height:2,background:"#e5e7eb"}}>
+                    <div style={{width:`${(done/total)*100}%`,height:"100%",background:"#111",transition:"width 0.4s"}} />
+                  </div>
+                  <span style={{fontSize:12,color:"#9ca3af"}}>{done}/{total}</span>
+                </div>
+              )}
+              {dueSoon>0 && (
+                <button onClick={()=>setNotifBanner({tasks:activeTasks.filter(t=>t.column!=="done"&&t.deadline&&deadlineStatus(t.deadline)?.urgent)})}
+                  style={{display:"flex",alignItems:"center",gap:5,background:"#fef2f2",border:"0.5px solid #fecaca",padding:"3px 10px",fontSize:11,color:"#dc2626",cursor:"pointer"}}>
+                  ⚠ {dueSoon} {dueSoon===1?"task scadent":"taskuri scadente"}
+                </button>
+              )}
+            </div>
+            <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+              <button onClick={()=>setShowSettings(true)} style={{display:"flex",alignItems:"center",gap:5,padding:"7px 12px",fontSize:12,border:"0.5px solid",borderColor:notifOk?"#bbf7d0":"#d1d5db",background:notifOk?"#f0fdf4":"transparent",color:notifOk?"#15803d":"#6b7280",cursor:"pointer"}}>
+                🔔 {settings.name||"Setări"}
+              </button>
+              <span style={{fontSize:11,color:"#d1d5db"}}>N = task nou</span>
+              <button onClick={()=>setShowExport(true)} disabled={!activeTasks.length} style={{...btnSec,opacity:activeTasks.length?1:0.4,cursor:activeTasks.length?"pointer":"default"}}>↓ Export</button>
+              <button onClick={()=>setShowImport(true)} style={btnSec}>↑ Import</button>
+              <button onClick={()=>openAdd()} style={btnPri}>+ Task nou</button>
+            </div>
+          </div>
+
+          {/* Tab nav */}
+          <div style={{display:"flex",gap:0}}>
+            {[
+              {id:"board",    label:"Board"},
+              {id:"calendar", label:"📅 Calendar"},
+              {id:"stats",    label:"📊 Statistici"},
+              {id:"archive",  label:`📦 Arhivă${archivedTasks.length>0?` (${archivedTasks.length})`:""}`},
+            ].map(tab => (
+              <button key={tab.id} onClick={()=>setActiveTab(tab.id)}
+                style={{padding:"9px 20px",fontSize:13,background:"none",border:"none",borderBottom:`2.5px solid ${activeTab===tab.id?"#111":"transparent"}`,color:activeTab===tab.id?"#111":"#6b7280",cursor:"pointer",fontWeight:activeTab===tab.id?500:400,transition:"all 0.15s",whiteSpace:"nowrap"}}>
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Board filters bar */}
+        {activeTab==="board" && (
+          <div style={{borderTop:"0.5px solid #f3f4f6",background:"#fafafa"}}>
+            <div style={{maxWidth:1280,margin:"0 auto",padding:"8px 32px",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              <div style={{position:"relative",flex:1,minWidth:180,maxWidth:320}}>
+                <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#9ca3af",fontSize:13}}>🔍</span>
+                <input value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} placeholder="Caută taskuri..."
+                  style={{width:"100%",border:"0.5px solid #d1d5db",padding:"6px 10px 6px 30px",fontSize:13,color:"#111",outline:"none",background:"#fff"}} />
+                {searchQuery && <button onClick={()=>setSearchQuery("")} style={{position:"absolute",right:8,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",fontSize:12,color:"#9ca3af"}}>✕</button>}
+              </div>
+              <div style={{width:1,height:18,background:"#e5e7eb"}} />
+              <span style={{fontSize:11,color:"#9ca3af"}}>Prioritate:</span>
+              {PRIORITIES.map(p=>(
+                <button key={p} onClick={()=>setFilterPri(filterPri===p?null:p)}
+                  style={{fontSize:11,padding:"4px 11px",border:"0.5px solid",borderColor:filterPri===p?pAccent[p]:"#d1d5db",background:filterPri===p?pAccent[p]:"transparent",color:filterPri===p?"#fff":"#6b7280",cursor:"pointer",transition:"all 0.15s",display:"flex",alignItems:"center",gap:4}}>
+                  <span style={{width:6,height:6,borderRadius:"50%",background:filterPri===p?"rgba(255,255,255,0.8)":pAccent[p],display:"inline-block"}} />{pLabel[p]}
+                </button>
+              ))}
+              <div style={{width:1,height:18,background:"#e5e7eb"}} />
+              <button onClick={()=>setSortDL(v=>!v)} style={{fontSize:11,padding:"4px 11px",border:"0.5px solid",borderColor:sortDL?"#111":"#d1d5db",background:sortDL?"#111":"transparent",color:sortDL?"#fff":"#6b7280",cursor:"pointer"}}>⏱ Deadline</button>
+              {hasFilters && <button onClick={()=>{setSearchQuery("");setFilterPri(null);setSortDL(false);}} style={{fontSize:11,color:"#ef4444",background:"none",border:"0.5px solid #fecaca",padding:"4px 10px",cursor:"pointer"}}>✕ Reset filtre</button>}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── TAB CONTENT ── */}
+      <div style={{maxWidth:1280,margin:"0 auto"}}>
+        {activeTab==="board"    && <BoardView    tasks={tasks} byCol={byCol} openAdd={openAdd} openEdit={openEdit} del={del} move={move} archiveTask={archiveTask} toggleSubtaskCard={toggleSubtaskCard} settings={settings} dragging={dragging} setDragging={setDragging} dragOver={dragOver} setDragOver={setDragOver} />}
+        {activeTab==="calendar" && <CalendarView tasks={activeTasks} openEdit={openEdit} />}
+        {activeTab==="stats"    && <StatsView    tasks={activeTasks} archivedCount={archivedTasks.length} />}
+        {activeTab==="archive"  && <ArchiveView  tasks={archivedTasks} unarchiveTask={unarchiveTask} del={del} />}
+      </div>
+
+      {/* ── MODALS ── */}
+      {modal        && <EditModal form={form} setForm={setForm} onSave={save} onClose={()=>setModal(false)} isEdit={!!editing} editingTask={editing?tasks.find(t=>t.id===editing.id):null} onAddNote={addNote} />}
+      {showExport   && <ExportModal   tasks={activeTasks} onClose={()=>setShowExport(false)} />}
+      {showImport   && <ImportModal   onImport={importTasks} onClose={()=>setShowImport(false)} />}
+      {showSettings && <SettingsModal settings={settings} setSettings={setSettings} onClose={()=>setShowSettings(false)} urgentTasks={activeTasks.filter(t=>t.column!=="done"&&t.deadline&&deadlineStatus(t.deadline)?.urgent)} />}
+      {notifBanner  && notifBanner.tasks.length>0 && <UrgentBanner tasks={notifBanner.tasks} settings={settings} onClose={()=>setNotifBanner(null)} onOpenSettings={()=>{setNotifBanner(null);setShowSettings(true);}} />}
+
+      {toast && (
+        <div style={{position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",background:"#111",color:"#fff",padding:"12px 20px",display:"flex",alignItems:"center",gap:16,fontSize:13,zIndex:300,boxShadow:"0 4px 20px rgba(0,0,0,0.2)",animation:"fadeIn 0.2s ease",whiteSpace:"nowrap"}}>
+          Task „<strong>{toast.task.title}</strong>" șters
+          <button onClick={undoDelete} style={{background:"none",border:"0.5px solid rgba(255,255,255,0.35)",color:"#fff",padding:"4px 12px",cursor:"pointer",fontSize:12}}>Anulează</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ══ BOARD VIEW ══ */
+function BoardView({ tasks, byCol, openAdd, openEdit, del, move, archiveTask, toggleSubtaskCard, settings, dragging, setDragging, dragOver, setDragOver }) {
+  const activeTasks = tasks.filter(t => !t.archived);
+  return (
+    <div style={{display:"flex",padding:"0 32px 40px",alignItems:"flex-start"}}>
+      {COLUMNS.map((col, i) => {
+        const colTasks = byCol(col.id);
+        const allInCol = activeTasks.filter(t => t.column===col.id);
+        const over     = dragOver===col.id;
+        const wipOver  = col.wipLimit && allInCol.length>col.wipLimit;
+        const priBreak = PRIORITIES.filter(p => allInCol.some(t => t.priority===p));
+        return (
+          <div key={col.id}
+            onDragOver={e=>{e.preventDefault();setDragOver(col.id);}}
+            onDrop={e=>{e.preventDefault();if(dragging)move(dragging,col.id);setDragging(null);setDragOver(null);}}
+            style={{flex:1,borderRight:i<COLUMNS.length-1?"0.5px solid #e5e7eb":"none",padding:"22px 24px",paddingLeft:i===0?0:24,background:wipOver?"#fffbeb":over?"#f9fafb":"transparent",transition:"background 0.15s"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,paddingBottom:12,borderBottom:"0.5px solid #e5e7eb"}}>
+              <div style={{display:"flex",alignItems:"center",gap:7}}>
+                <span style={{fontSize:11,fontWeight:500,letterSpacing:"0.08em",textTransform:"uppercase",color:wipOver?"#d97706":"#6b7280"}}>{col.label}</span>
+                <span style={{fontSize:11,color:wipOver?"#d97706":"#9ca3af"}}>{allInCol.length}{col.wipLimit?`/${col.wipLimit}`:""}</span>
+                {priBreak.length>0 && <div style={{display:"flex",gap:3}}>{priBreak.map(p=><span key={p} style={{fontSize:9,color:"#fff",background:pAccent[p],padding:"1px 5px"}}>{allInCol.filter(t=>t.priority===p).length}{p[0].toUpperCase()}</span>)}</div>}
+              </div>
+              <button onClick={()=>openAdd(col.id)} style={{display:"flex",alignItems:"center",gap:5,background:"none",border:"0.5px solid #d1d5db",padding:"5px 12px",cursor:"pointer",fontSize:12,color:"#6b7280"}}>
+                <span style={{fontSize:15,lineHeight:1}}>+</span> Task
+              </button>
+            </div>
+            <div style={{display:"flex",flexDirection:"column"}}>
+              {colTasks.map(task => (
+                <Card key={task.id} task={task}
+                  onEdit={()=>openEdit(task)} onDelete={()=>del(task.id)}
+                  onMove={move} onArchive={()=>archiveTask(task.id)}
+                  onDragStart={(e,t)=>{setDragging(t.id);e.dataTransfer.effectAllowed="move";}}
+                  onDragEnd={()=>{setDragging(null);setDragOver(null);}}
+                  isDragging={dragging===task.id}
+                  onToggleSubtask={li=>toggleSubtaskCard(task.id,li)}
+                  settings={settings} />
+              ))}
+              {colTasks.length===0 && (
+                <div style={{textAlign:"center",padding:"32px 0"}}>
+                  <div style={{fontSize:24,marginBottom:8}}>{col.id==="todo"?"📋":col.id==="inprogress"?"⚙️":"✅"}</div>
+                  <div style={{fontSize:12,color:"#9ca3af",marginBottom:12}}>{col.id==="todo"?"Niciun task planificat":col.id==="inprogress"?"Nimic în lucru":"Niciun task finalizat"}</div>
+                  <button onClick={()=>openAdd(col.id)} style={{fontSize:11,color:"#6b7280",background:"none",border:"0.5px solid #d1d5db",padding:"5px 14px",cursor:"pointer"}}>+ Adaugă task</button>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ══ CALENDAR VIEW ══ */
+function CalendarView({ tasks, openEdit }) {
+  const now = new Date();
+  const [vY, setVY] = useState(now.getFullYear());
+  const [vM, setVM] = useState(now.getMonth());
+  const today = new Date(); today.setHours(0,0,0,0);
+  const MN = ["Ianuarie","Februarie","Martie","Aprilie","Mai","Iunie","Iulie","August","Septembrie","Octombrie","Noiembrie","Decembrie"];
+  const firstDay  = (new Date(vY,vM,1).getDay()+6)%7;
+  const daysInM   = new Date(vY,vM+1,0).getDate();
+  const prevM = () => { if(vM===0){setVM(11);setVY(y=>y-1);}else setVM(m=>m-1); };
+  const nextM = () => { if(vM===11){setVM(0);setVY(y=>y+1);}else setVM(m=>m+1); };
+  const toStr = (y,m,d) => `${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+
+  // Group tasks by deadline
+  const tasksByDate = {};
+  tasks.filter(t=>t.deadline).forEach(t => { if(!tasksByDate[t.deadline]) tasksByDate[t.deadline]=[]; tasksByDate[t.deadline].push(t); });
+
+  return (
+    <div style={{padding:"24px 32px 40px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:12}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <button onClick={prevM} style={{background:"none",border:"0.5px solid #d1d5db",padding:"6px 14px",cursor:"pointer",fontSize:14,color:"#374151"}}>‹</button>
+          <h2 style={{fontSize:17,fontWeight:500,minWidth:220,textAlign:"center"}}>{MN[vM]} {vY}</h2>
+          <button onClick={nextM} style={{background:"none",border:"0.5px solid #d1d5db",padding:"6px 14px",cursor:"pointer",fontSize:14,color:"#374151"}}>›</button>
+          <button onClick={()=>{setVY(now.getFullYear());setVM(now.getMonth());}} style={{fontSize:12,color:"#6b7280",background:"none",border:"0.5px solid #d1d5db",padding:"5px 12px",cursor:"pointer"}}>Azi</button>
+        </div>
+        <div style={{display:"flex",gap:14,flexWrap:"wrap"}}>
+          {[["#ef4444","High"],["#f59e0b","Medium"],["#aaaaaa","Low"],["#e5e7eb","Done"]].map(([c,l])=>(
+            <div key={l} style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#6b7280"}}>
+              <span style={{width:10,height:10,background:c,borderRadius:2,display:"inline-block"}} />{l}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Day headers */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",marginBottom:1}}>
+        {["Lun","Mar","Mie","Joi","Vin","Sâm","Dum"].map((d,i)=>(
+          <div key={d} style={{textAlign:"center",fontSize:11,fontWeight:500,color:i>=5?"#9ca3af":"#6b7280",letterSpacing:"0.05em",textTransform:"uppercase",padding:"0 0 8px"}}>{d}</div>
+        ))}
+      </div>
+
+      {/* Grid */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
+        {Array.from({length:firstDay}).map((_,i)=><div key={"e"+i} style={{minHeight:110,background:"#fafafa",border:"0.5px solid #f3f4f6"}} />)}
+        {Array.from({length:daysInM}).map((_,i)=>{
+          const day=i+1, str=toStr(vY,vM,day), dObj=new Date(str+"T00:00:00");
+          const isToday    = dObj.getTime()===today.getTime();
+          const isPast     = dObj<today;
+          const dayTasks   = tasksByDate[str]||[];
+          const hasPending = dayTasks.some(t=>t.column!=="done");
+          return (
+            <div key={day} style={{minHeight:110,background:isToday?"#fffbeb":isPast&&hasPending?"#fff9f9":"#fff",border:`0.5px solid ${isToday?"#f59e0b":"#f3f4f6"}`,padding:"6px 7px",transition:"background 0.15s"}}>
+              <div style={{marginBottom:5,width:22,height:22,display:"flex",alignItems:"center",justifyContent:"center",borderRadius:"50%",background:isToday?"#111":"transparent",color:isToday?"#fff":isPast&&hasPending?"#dc2626":"#374151",fontSize:12,fontWeight:isToday?700:400}}>
+                {day}
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:2}}>
+                {dayTasks.slice(0,3).map(t=>(
+                  <div key={t.id} onClick={()=>openEdit(t)} title={t.title}
+                    style={{fontSize:10,padding:"2px 5px",background:t.column==="done"?"#e5e7eb":pAccent[t.priority],color:t.column==="done"?"#9ca3af":t.priority==="low"?"#374151":"#fff",cursor:"pointer",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",borderRadius:2,textDecoration:t.column==="done"?"line-through":"none",opacity:t.column==="done"?0.65:1}}>
+                    {t.title}
+                  </div>
+                ))}
+                {dayTasks.length>3 && <div style={{fontSize:10,color:"#9ca3af",paddingLeft:2}}>+{dayTasks.length-3} altele</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ══ STATS VIEW ══ */
+function StatsView({ tasks, archivedCount }) {
+  const today   = new Date(); today.setHours(0,0,0,0);
+  const weekAgo = new Date(today); weekAgo.setDate(weekAgo.getDate()-7);
+
+  const totalActive  = tasks.length;
+  const inProgress   = tasks.filter(t=>t.column==="inprogress").length;
+  const overdue      = tasks.filter(t=>t.column!=="done"&&t.deadline&&new Date(t.deadline+"T00:00:00")<today).length;
+  const doneThisWeek = tasks.filter(t=>{
+    if(t.column!=="done") return false;
+    const moved=[...(t.activity||[])].reverse().find(e=>e.type==="moved"&&e.to==="Done");
+    return moved ? new Date(moved.ts)>=weekAgo : new Date(t.createdAt)>=weekAgo;
+  }).length;
+
+  const byColData  = COLUMNS.map(c=>({...c,count:tasks.filter(t=>t.column===c.id).length}));
+  const maxCol     = Math.max(...byColData.map(c=>c.count),1);
+  const byPriData  = PRIORITIES.map(p=>({p,label:pLabel[p],count:tasks.filter(t=>t.priority===p&&t.column!=="done").length,color:pAccent[p]}));
+  const maxPri     = Math.max(...byPriData.map(p=>p.count),1);
+
+  const allActivity = tasks.flatMap(t=>(t.activity||[]).map(e=>({...e,taskTitle:t.title})));
+  allActivity.sort((a,b)=>new Date(b.ts)-new Date(a.ts));
+  const recent = allActivity.slice(0,12);
+
+  const evColor = type => ({note:"#111",moved:"#f59e0b",archived:"#6b7280",created:"#22c55e",unarchived:"#3b82f6"}[type]||"#d1d5db");
+  const evLabel = ev => ({created:"creat",moved:`→ ${ev.to}`,note:"notă adăugată",archived:"arhivat",unarchived:"restaurat",changed:`${ev.field} modificat`}[ev.type]||ev.type);
+
+  const StatCard = ({label,value,sub,color}) => (
+    <div style={{flex:1,minWidth:140,border:"0.5px solid #e5e7eb",padding:"20px 24px"}}>
+      <div style={{fontSize:36,fontWeight:300,color:color||"#111",marginBottom:2,letterSpacing:"-1px",lineHeight:1}}>{value}</div>
+      <div style={{fontSize:13,fontWeight:500,color:"#374151",marginBottom:3,marginTop:4}}>{label}</div>
+      {sub&&<div style={{fontSize:11,color:"#9ca3af"}}>{sub}</div>}
+    </div>
+  );
+
+  return (
+    <div style={{padding:"24px 32px 40px"}}>
+      <h2 style={{fontSize:16,fontWeight:500,marginBottom:20}}>Statistici board</h2>
+
+      {/* Stat cards */}
+      <div style={{display:"flex",gap:12,marginBottom:24,flexWrap:"wrap"}}>
+        <StatCard label="Taskuri active"         value={totalActive}  sub={archivedCount>0?`+ ${archivedCount} arhivate`:undefined} />
+        <StatCard label="Finalizate săptămâna asta" value={doneThisWeek} color="#15803d" sub="ultimele 7 zile" />
+        <StatCard label="În lucru"               value={inProgress}   color="#d97706"  sub="coloana In Progress" />
+        <StatCard label="Expirate"               value={overdue}      color={overdue>0?"#dc2626":"#111"} sub={overdue>0?"necesită atenție":"totul în regulă"} />
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        {/* By column */}
+        <div style={{border:"0.5px solid #e5e7eb",padding:"20px 24px"}}>
+          <div style={{fontSize:10,fontWeight:500,color:"#9ca3af",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:16}}>Distribuție coloane</div>
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            {byColData.map(col=>(
+              <div key={col.id}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                  <span style={{fontSize:13,color:"#374151"}}>{col.label}</span>
+                  <span style={{fontSize:13,fontWeight:500}}>{col.count}</span>
+                </div>
+                <div style={{height:6,background:"#f3f4f6",borderRadius:3}}>
+                  <div style={{height:"100%",width:`${(col.count/maxCol)*100}%`,background:col.accent,borderRadius:3,transition:"width 0.5s"}} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* By priority */}
+        <div style={{border:"0.5px solid #e5e7eb",padding:"20px 24px"}}>
+          <div style={{fontSize:10,fontWeight:500,color:"#9ca3af",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:16}}>Taskuri active după prioritate</div>
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            {byPriData.map(({p,label,count,color})=>(
+              <div key={p}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                  <div style={{display:"flex",alignItems:"center",gap:7}}>
+                    <span style={{width:8,height:8,borderRadius:"50%",background:color,display:"inline-block"}} />
+                    <span style={{fontSize:13,color:"#374151"}}>{label}</span>
+                  </div>
+                  <span style={{fontSize:13,fontWeight:500}}>{count}</span>
+                </div>
+                <div style={{height:6,background:"#f3f4f6",borderRadius:3}}>
+                  <div style={{height:"100%",width:`${(count/maxPri)*100}%`,background:color,borderRadius:3,transition:"width 0.5s"}} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Recent activity */}
+      <div style={{border:"0.5px solid #e5e7eb",padding:"20px 24px"}}>
+        <div style={{fontSize:10,fontWeight:500,color:"#9ca3af",textTransform:"uppercase",letterSpacing:"0.07em",marginBottom:16}}>Activitate recentă</div>
+        {recent.length===0
+          ? <div style={{fontSize:13,color:"#9ca3af"}}>Nicio activitate înregistrată.</div>
+          : recent.map((ev,i)=>(
+            <div key={ev.id} style={{display:"flex",alignItems:"flex-start",gap:12,padding:"8px 0",borderBottom:i<recent.length-1?"0.5px solid #f3f4f6":"none"}}>
+              <div style={{width:8,height:8,borderRadius:"50%",marginTop:4,flexShrink:0,background:evColor(ev.type)}} />
+              <div style={{flex:1,minWidth:0}}>
+                <span style={{fontSize:12,color:"#374151",fontWeight:500}}>{ev.taskTitle} </span>
+                <span style={{fontSize:12,color:"#9ca3af"}}>{evLabel(ev)}</span>
+              </div>
+              <div style={{fontSize:11,color:"#d1d5db",flexShrink:0}}>{fmtTs(ev.ts)}</div>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  );
+}
+
+/* ══ ARCHIVE VIEW ══ */
+function ArchiveView({ tasks, unarchiveTask, del }) {
+  const [search, setSearch] = useState("");
+  const filtered = search ? tasks.filter(t=>t.title.toLowerCase().includes(search.toLowerCase())||(t.description||"").toLowerCase().includes(search.toLowerCase())) : tasks;
+  const sorted   = [...filtered].sort((a,b)=>new Date(b.archivedAt||b.createdAt)-new Date(a.archivedAt||a.createdAt));
+
+  return (
+    <div style={{padding:"24px 32px 40px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,gap:14,flexWrap:"wrap"}}>
+        <div>
+          <h2 style={{fontSize:16,fontWeight:500,marginBottom:4}}>Arhivă</h2>
+          <p style={{fontSize:12,color:"#9ca3af"}}>{tasks.length} {tasks.length===1?"task arhivat":"taskuri arhivate"} · Taskurile din Done pot fi arhivate cu butonul 📦</p>
+        </div>
+        <div style={{position:"relative",width:260}}>
+          <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#9ca3af",fontSize:13}}>🔍</span>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Caută în arhivă..."
+            style={{width:"100%",border:"0.5px solid #d1d5db",padding:"7px 10px 7px 30px",fontSize:13,color:"#111",outline:"none",background:"#fff"}} />
+        </div>
+      </div>
+
+      {sorted.length===0
+        ? (
+          <div style={{textAlign:"center",padding:"60px 0"}}>
+            <div style={{fontSize:44,marginBottom:14}}>📦</div>
+            <div style={{fontSize:14,color:"#9ca3af",marginBottom:6}}>{search?"Niciun rezultat găsit":"Arhiva este goală"}</div>
+            <div style={{fontSize:12,color:"#d1d5db"}}>{!search&&"Mută taskuri în Done, apoi apasă 📦 pentru a le arhiva"}</div>
+          </div>
+        )
+        : (
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {sorted.map(task=>(
+              <div key={task.id} style={{display:"flex",alignItems:"center",gap:14,border:"0.5px solid #e5e7eb",padding:"12px 16px",borderLeft:`2.5px solid ${pAccent[task.priority]}`,background:"#fafafa"}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:500,color:"#9ca3af",textDecoration:"line-through",marginBottom:3,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{task.title}</div>
+                  <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                    <span style={{fontSize:11,color:"#9ca3af"}}>{pLabel[task.priority]}</span>
+                    <span style={{fontSize:11,color:"#d1d5db"}}>·</span>
+                    <span style={{fontSize:11,color:"#9ca3af"}}>{COLUMNS.find(c=>c.id===task.column)?.label}</span>
+                    {task.deadline&&<><span style={{fontSize:11,color:"#d1d5db"}}>·</span><span style={{fontSize:11,color:"#9ca3af"}}>deadline: {fmt(task.deadline)}</span></>}
+                    <span style={{fontSize:11,color:"#d1d5db"}}>·</span>
+                    <span style={{fontSize:11,color:"#d1d5db"}}>arhivat {task.archivedAt?fmtTs(task.archivedAt):""}</span>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:6,flexShrink:0}}>
+                  <button onClick={()=>unarchiveTask(task.id)} style={{...btnSec,fontSize:11,padding:"5px 12px"}}>↩ Restaurează</button>
+                  <button onClick={()=>del(task.id)} style={{background:"none",border:"0.5px solid #fecaca",color:"#fca5a5",padding:"5px 10px",fontSize:11,cursor:"pointer"}} title="Șterge definitiv">✕</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )
+      }
+    </div>
+  );
+}
+
+/* ══ CARD ══ */
+function Card({ task, onEdit, onDelete, onMove, onArchive, onDragStart, onDragEnd, isDragging, onToggleSubtask, settings }) {
+  const dl = deadlineStatus(task.deadline);
+  const isDone     = task.column==="done";
+  const others     = COLUMNS.filter(c=>c.id!==task.column);
+  const subtasks   = parseSubtasks(task.description||"");
+  const nonSubDesc = (task.description||"").split("\n").filter(l=>!l.match(/^- \[[ x]\] /)).join("\n").trim();
+  const mailtoLink = dl?.urgent && settings.email ? buildMailto(settings.email,[task],settings.name) : null;
+  const wasDragged = useRef(false);
+  const mousePos   = useRef(null);
+  return (
+    <div draggable
+      onDragStart={e=>{wasDragged.current=true;onDragStart(e,task);}}
+      onDragEnd={onDragEnd}
+      onMouseDown={e=>{mousePos.current={x:e.clientX,y:e.clientY};wasDragged.current=false;}}
+      onMouseMove={e=>{if(!mousePos.current)return;if(Math.abs(e.clientX-mousePos.current.x)>4||Math.abs(e.clientY-mousePos.current.y)>4)wasDragged.current=true;}}
+      onClick={e=>{if(wasDragged.current||e.target.closest("button")||e.target.closest("a")||e.target.closest("input[type=checkbox]"))return;onEdit();}}
+      onMouseEnter={e=>{if(!isDragging)e.currentTarget.style.boxShadow="0 2px 8px rgba(0,0,0,0.08)";}}
+      onMouseLeave={e=>{e.currentTarget.style.boxShadow="none";}}
+      style={{borderLeft:`2.5px solid ${pAccent[task.priority]}`,padding:"12px 12px 12px 14px",marginBottom:10,background:dl?.urgent&&!isDone?"#fffbeb":"#fafafa",opacity:isDragging?0.4:1,cursor:"pointer",transition:"opacity 0.15s, box-shadow 0.15s"}}>
+      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:8,marginBottom:6}}>
+        <span style={{fontSize:13,fontWeight:500,lineHeight:1.45,textDecoration:isDone?"line-through":"none",color:isDone?"#9ca3af":"#111"}}>{task.title}</span>
+        <div style={{display:"flex",gap:2,flexShrink:0}}>
+          <button onClick={e=>{e.stopPropagation();onEdit();}} style={btnIcon} title="Editează">✎</button>
+          {isDone && <button onClick={e=>{e.stopPropagation();onArchive();}} style={{...btnIcon,color:"#9ca3af",fontSize:13}} title="Arhivează">📦</button>}
+          <button onClick={e=>{e.stopPropagation();onDelete();}} style={{...btnIcon,color:"#fca5a5"}} title="Șterge">✕</button>
+        </div>
+      </div>
+      {nonSubDesc && <div style={{fontSize:12,color:"#6b7280",lineHeight:1.5,marginBottom:6,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{nonSubDesc}</div>}
+      {subtasks.length>0 && (
+        <div style={{marginBottom:7,display:"flex",flexDirection:"column",gap:4}}>
+          {subtasks.map(st=>(
+            <label key={st.index} onClick={e=>e.stopPropagation()} style={{display:"flex",alignItems:"flex-start",gap:7,cursor:"pointer",fontSize:12,color:st.checked?"#9ca3af":"#374151",lineHeight:1.4}}>
+              <input type="checkbox" checked={st.checked} onChange={()=>onToggleSubtask(st.index)} style={{marginTop:2,accentColor:"#111",flexShrink:0}} />
+              <span style={{textDecoration:st.checked?"line-through":"none"}}>{st.text}</span>
+            </label>
+          ))}
+          <div style={{fontSize:10,color:"#d1d5db",marginTop:1}}>{subtasks.filter(s=>s.checked).length}/{subtasks.length} completate</div>
+        </div>
+      )}
+      {dl && (
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+          <div style={{fontSize:11,color:dl.color}}>⏱ {dl.label}</div>
+          {mailtoLink&&!isDone&&<a href={mailtoLink} onClick={e=>e.stopPropagation()} style={{fontSize:10,color:"#d97706",textDecoration:"none",border:"0.5px solid #fde68a",padding:"2px 7px",background:"#fffbeb"}}>✉ reminder</a>}
+        </div>
+      )}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:4}}>
+        <span style={{fontSize:10,color:"#d1d5db"}}>{new Date(task.createdAt).toLocaleDateString("ro-RO",{day:"numeric",month:"short"})}</span>
+        <div style={{display:"flex",gap:5}}>{others.map(col=><button key={col.id} onClick={e=>{e.stopPropagation();onMove(task.id,col.id);}} style={btnMove}>→ {col.label}</button>)}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ══ EXPORT MODAL ══ */
+function ExportModal({ tasks, onClose }) {
+  const json = JSON.stringify(tasks, null, 2);
+  const [copied, setCopied] = useState(false);
+  const textRef = useRef(null);
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(json); } catch { if(textRef.current){textRef.current.select();document.execCommand("copy");} }
+    setCopied(true); setTimeout(()=>setCopied(false),2500);
+  };
+  return (
+    <Overlay onClose={onClose} title="Export taskuri" maxWidth={580}>
+      <div style={{padding:"20px 28px",display:"flex",flexDirection:"column",gap:14,flex:1}}>
+        <p style={{fontSize:12,color:"#6b7280",lineHeight:1.6}}>Copiază JSON-ul și salvează-l ca <code style={{background:"#f3f4f6",padding:"1px 5px",fontSize:11}}>.json</code>. La import, tot istoricul de activitate este restaurat.</p>
+        <textarea ref={textRef} readOnly value={json} style={{flex:1,minHeight:300,border:"0.5px solid #d1d5db",padding:12,fontSize:11,fontFamily:"monospace",color:"#374151",background:"#f9fafb",resize:"none",outline:"none",lineHeight:1.6,width:"100%"}} />
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <span style={{fontSize:11,color:"#9ca3af"}}>{tasks.length} taskuri · {(new Blob([json]).size/1024).toFixed(1)} KB</span>
+          <button onClick={copy} style={{...btnPri,background:copied?"#15803d":"#111",transition:"background 0.2s",display:"flex",alignItems:"center",gap:7}}>
+            {copied?"✓ Copiat!":"📋 Copiază JSON"}
+          </button>
+        </div>
+      </div>
+    </Overlay>
+  );
+}
+
+/* ══ IMPORT MODAL ══ */
+function ImportModal({ onImport, onClose }) {
+  const [parsed, setParsed] = useState(null);
+  const [error,  setError]  = useState(null);
+  const [dragF,  setDragF]  = useState(false);
+  const fileRef = useRef(null);
+  const handleFile = f => {
+    setError(null); setParsed(null);
+    if (!f.name.endsWith(".json")) { setError("Acceptă doar fișiere .json exportate din acest board."); return; }
+    const r = new FileReader();
+    r.onload = e => {
+      try {
+        const arr = JSON.parse(e.target.result);
+        if (!Array.isArray(arr)||!arr[0]?.title) throw new Error();
+        setParsed(arr.map((t,i)=>({...t,_id:i,priority:t.priority||"medium",column:t.column||"todo",description:t.description||""})));
+      } catch { setError("Format invalid. Folosește un fișier exportat din acest board."); }
+    };
+    r.readAsText(f);
+  };
+  const doImport = () => {
+    const now = new Date().toISOString();
+    onImport(parsed.map(t=>({id:Date.now().toString()+Math.random(),title:t.title,description:t.description,priority:t.priority,column:t.column,deadline:t.deadline||"",createdAt:t.createdAt||now,activity:t.activity||[makeEv("created")],archived:t.archived||false,archivedAt:t.archivedAt||null})));
+    onClose();
+  };
+  return (
+    <Overlay onClose={onClose} title="Import taskuri" maxWidth={520}>
+      <div style={{padding:"22px 28px",flex:1}}>
+        {!parsed ? (
+          <>
+            <div onDragOver={e=>{e.preventDefault();setDragF(true);}} onDragLeave={()=>setDragF(false)}
+              onDrop={e=>{e.preventDefault();setDragF(false);const f=e.dataTransfer.files[0];if(f)handleFile(f);}}
+              onClick={()=>fileRef.current?.click()}
+              style={{border:`1.5px dashed ${dragF?"#111":"#d1d5db"}`,padding:"48px 20px",textAlign:"center",cursor:"pointer",background:dragF?"#f9fafb":"#fff",transition:"all 0.15s",marginBottom:14}}>
+              <div style={{fontSize:40,marginBottom:12}}>📂</div>
+              <div style={{fontSize:14,fontWeight:500,color:"#374151",marginBottom:6}}>Trage fișierul JSON sau click</div>
+              <div style={{fontSize:12,color:"#9ca3af"}}>Doar fișiere <strong>.json</strong> exportate din acest board</div>
+              <input ref={fileRef} type="file" accept=".json" style={{display:"none"}} onChange={e=>{if(e.target.files[0])handleFile(e.target.files[0]);}} />
+            </div>
+            {error&&<div style={{padding:"12px 16px",background:"#fef2f2",border:"0.5px solid #fecaca",color:"#dc2626",fontSize:13}}>{error}</div>}
+          </>
+        ) : (
+          <>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+              <div style={{fontSize:14,fontWeight:500}}>{parsed.length} taskuri detectate</div>
+              <button onClick={()=>setParsed(null)} style={{fontSize:12,color:"#9ca3af",background:"none",border:"0.5px solid #d1d5db",padding:"5px 12px",cursor:"pointer"}}>← Înapoi</button>
+            </div>
+            <div style={{maxHeight:320,overflowY:"auto",display:"flex",flexDirection:"column",gap:6}}>
+              {parsed.map(t=>(
+                <div key={t._id} style={{border:"0.5px solid #e5e7eb",padding:"10px 14px",borderLeft:`2.5px solid ${pAccent[t.priority||"medium"]}`}}>
+                  <div style={{fontSize:13,fontWeight:500,marginBottom:3}}>{t.title}</div>
+                  <div style={{fontSize:11,color:"#9ca3af"}}>{pLabel[t.priority||"medium"]} · {COLUMNS.find(c=>c.id===t.column)?.label}{t.deadline?` · ${fmt(t.deadline)}`:""}</div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+      <ModalFooter onClose={onClose}>{parsed?.length>0&&<button onClick={doImport} style={btnPri}>↓ Import {parsed.length} taskuri</button>}</ModalFooter>
+    </Overlay>
+  );
+}
+
+/* ══ SETTINGS MODAL ══ */
+function SettingsModal({ settings, setSettings, onClose, urgentTasks }) {
+  const [local,   setLocal]   = useState(settings);
+  const [testing, setTesting] = useState(false);
+  const [permSt,  setPermSt]  = useState("Notification" in window ? Notification.permission : "unsupported");
+  const enableNotifications = async () => { const ok=await requestNotifPermission(); setPermSt(ok?"granted":"denied"); setLocal(p=>({...p,notifGranted:ok})); };
+  const save = () => { setSettings(local); onClose(); };
+  const testMail = local.email ? buildMailto(local.email,urgentTasks.length?urgentTasks:[{title:"Task demo",deadline:new Date().toISOString().split("T")[0],priority:"high"}],local.name) : null;
+  return (
+    <Overlay onClose={onClose} title="🔔 Setări notificări & profil" maxWidth={520}>
+      <div style={{padding:"24px 28px",display:"flex",flexDirection:"column",gap:22,overflowY:"auto",flex:1}}>
+        <Section title="Profil personal">
+          <p style={{fontSize:12,color:"#6b7280",marginBottom:14,lineHeight:1.6}}>Salvat local în browser-ul tău. Fiecare coleg configurează separat.</p>
+          <Field label="Numele tău"><input value={local.name} onChange={e=>setLocal(p=>({...p,name:e.target.value}))} placeholder="ex. Dima" style={inputSt} /></Field>
+          <div style={{marginTop:14}}>
+            <Field label="Email (pentru remindere)">
+              <input value={local.email} onChange={e=>setLocal(p=>({...p,email:e.target.value}))} placeholder="ex. dima@orange.md" type="email" style={inputSt} />
+              <div style={{fontSize:11,color:"#9ca3af",marginTop:5}}>Butonul „✉ reminder" de pe carduri deschide Outlook cu email pre-completat.</div>
+            </Field>
+          </div>
+        </Section>
+        <Section title="Notificări browser (popup Windows/Mac)">
+          <p style={{fontSize:12,color:"#6b7280",marginBottom:14,lineHeight:1.6}}>Notificări native OS — apar chiar dacă tab-ul e minimizat, cât timp browser-ul e deschis.</p>
+          <div style={{padding:"12px 16px",background:permSt==="granted"?"#f0fdf4":permSt==="denied"?"#fef2f2":"#f9fafb",border:"0.5px solid",borderColor:permSt==="granted"?"#bbf7d0":permSt==="denied"?"#fecaca":"#e5e7eb",marginBottom:14}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+              <span style={{fontSize:16}}>{permSt==="granted"?"✅":permSt==="denied"?"🚫":"⏳"}</span>
+              <span style={{fontSize:13,fontWeight:500,color:permSt==="granted"?"#15803d":permSt==="denied"?"#dc2626":"#374151"}}>
+                {permSt==="granted"?"Permisiune acordată ✓":permSt==="denied"?"Blocat — permite din setările browser-ului":permSt==="unsupported"?"Browser incompatibil":"Neactivat încă"}
+              </span>
+            </div>
+            {permSt==="default"&&<button onClick={enableNotifications} style={{...btnPri,fontSize:12,padding:"7px 16px",marginTop:4}}>Activează notificări</button>}
+            {permSt==="granted"&&<button onClick={()=>{setTesting(true);showBrowserNotif("🔔 Test Kanban","Notificările funcționează!","test");setTimeout(()=>setTesting(false),1500);}} style={{...btnSec,fontSize:12,padding:"5px 14px",marginTop:4}} disabled={testing}>{testing?"✓ Trimis!":"Testează notificarea"}</button>}
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {[{key:"notifyDayBefore",label:"Cu o zi înainte de deadline",desc:"La deschiderea board-ului în ziua precedentă"},{key:"notifyOnDay",label:"Chiar în ziua deadline-ului",desc:"Notificare urgentă în ziua scadenței"}].map(({key,label,desc})=>(
+              <label key={key} style={{display:"flex",alignItems:"flex-start",gap:12,cursor:"pointer",padding:"10px 14px",border:"0.5px solid #e5e7eb",background:local[key]?"#f9fafb":"#fff"}}>
+                <input type="checkbox" checked={local[key]} onChange={e=>setLocal(p=>({...p,[key]:e.target.checked}))} style={{marginTop:2,accentColor:"#111",flexShrink:0}} />
+                <div><div style={{fontSize:13,fontWeight:500}}>{label}</div><div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>{desc}</div></div>
+              </label>
+            ))}
+          </div>
+        </Section>
+        <Section title="Reminder email (manual)">
+          {local.email
+            ? <a href={testMail||"#"} style={{display:"inline-flex",alignItems:"center",gap:6,background:"#f9fafb",border:"0.5px solid #d1d5db",padding:"8px 16px",fontSize:12,color:"#374151",textDecoration:"none"}}>✉ Trimite email test → {local.email}</a>
+            : <p style={{fontSize:12,color:"#9ca3af"}}>Adaugă adresa de email mai sus pentru a activa.</p>
+          }
+        </Section>
+      </div>
+      <ModalFooter onClose={onClose}><button onClick={save} style={btnPri}>Salvează</button></ModalFooter>
+    </Overlay>
+  );
+}
+
+/* ══ URGENT BANNER ══ */
+function UrgentBanner({ tasks, settings, onClose, onOpenSettings }) {
+  const today = tasks.filter(t=>deadlineStatus(t.deadline)?.diff===0);
+  const tom   = tasks.filter(t=>deadlineStatus(t.deadline)?.diff===1);
+  const mailtoLink = settings.email ? buildMailto(settings.email,tasks,settings.name) : null;
+  return (
+    <div style={{position:"fixed",top:0,left:0,right:0,zIndex:250,animation:"slideDown 0.25s ease"}}>
+      <div style={{background:"#111",color:"#fff",padding:"14px 28px",display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+        <span style={{fontSize:18}}>⚠️</span>
+        <div style={{flex:1}}>
+          <div style={{fontSize:13,fontWeight:500,marginBottom:3}}>
+            {today.length>0&&<span style={{color:"#fca5a5"}}>{today.length} task{today.length>1?"uri":""} scadente AZI</span>}
+            {today.length>0&&tom.length>0&&<span style={{color:"#d1d5db",margin:"0 8px"}}>·</span>}
+            {tom.length>0&&<span style={{color:"#fcd34d"}}>{tom.length} task{tom.length>1?"uri":""} scadente MÂINE</span>}
+          </div>
+          <div style={{fontSize:11,color:"#9ca3af"}}>{tasks.map(t=>t.title).join(" · ")}</div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {mailtoLink
+            ? <a href={mailtoLink} style={{background:"none",border:"0.5px solid rgba(255,255,255,0.4)",color:"#fff",padding:"6px 14px",fontSize:12,textDecoration:"none"}}>✉ Trimite reminder</a>
+            : <button onClick={onOpenSettings} style={{background:"none",border:"0.5px solid rgba(255,255,255,0.4)",color:"#d1d5db",padding:"6px 14px",fontSize:12,cursor:"pointer"}}>✉ Setează email</button>
+          }
+          <button onClick={onClose} style={{background:"none",border:"none",color:"#9ca3af",fontSize:18,cursor:"pointer",padding:"2px 6px"}}>✕</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══ EDIT MODAL ══ */
+function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddNote }) {
+  const valid    = form.title.trim();
+  const today    = new Date().toISOString().split("T")[0];
+  const activity = editingTask?.activity||[];
+  const [note, setNote] = useState("");
+  const feedRef = useRef(null);
+  const noteRef = useRef(null);
+  useEffect(()=>{ if(feedRef.current) feedRef.current.scrollTop=feedRef.current.scrollHeight; },[activity.length]);
+  const submitNote = () => { if(!note.trim()||!editingTask)return; onAddNote(editingTask.id,note.trim()); setNote(""); };
+  const applyFmt = m => {
+    const ta=noteRef.current; if(!ta)return;
+    const s=ta.selectionStart,e2=ta.selectionEnd;
+    const nn=note.substring(0,s)+m+note.substring(s,e2)+m+note.substring(e2);
+    setNote(nn); setTimeout(()=>{ta.focus();ta.setSelectionRange(s+m.length,e2+m.length);},0);
+  };
+  const FMT=[
+    {label:<strong style={{fontSize:12}}>B</strong>,action:()=>applyFmt("**")},
+    {label:<em style={{fontSize:12}}>I</em>,action:()=>applyFmt("*")},
+    {label:<s style={{fontSize:12}}>S</s>,action:()=>applyFmt("~~")},
+    {label:<code style={{fontSize:11,fontFamily:"monospace"}}>`</code>,action:()=>applyFmt("`")},
+  ];
+  const handleNKD=e=>{
+    if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();submitNote();return;}
+    if((e.ctrlKey||e.metaKey)&&e.key==="b"){e.preventDefault();applyFmt("**");}
+    if((e.ctrlKey||e.metaKey)&&e.key==="i"){e.preventDefault();applyFmt("*");}
+  };
+  const evColor = type => ({note:"#111",moved:"#f59e0b",archived:"#6b7280",unarchived:"#3b82f6",created:"#22c55e"}[type]||"#f3f4f6");
+  return (
+    <Overlay onClose={onClose} title={isEdit?"Editează task":"Task nou"} maxWidth={isEdit?920:540} noScroll>
+      <div style={{display:"flex",flex:1,minHeight:0}}>
+        <div style={{flex:1,padding:"22px 28px",display:"flex",flexDirection:"column",gap:16,borderRight:isEdit?"0.5px solid #e5e7eb":"none",overflowY:"auto"}}>
+          <Field label="Titlu *"><input autoFocus value={form.title} onChange={e=>setForm(p=>({...p,title:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&onSave()} placeholder="Ce trebuie făcut?" style={inputSt} /></Field>
+          <Field label="Descriere">
+            <textarea value={form.description} onChange={e=>setForm(p=>({...p,description:e.target.value}))} placeholder={"Detalii, linkuri...\n\n- [ ] Sub-task 1\n- [ ] Sub-task 2"} rows={6} style={{...inputSt,resize:"vertical",lineHeight:1.5}} />
+            <div style={{fontSize:10,color:"#9ca3af",marginTop:4}}>Sfat: <code style={{background:"#f3f4f6",padding:"0 3px"}}>- [ ] text</code> pentru sub-taskuri</div>
+          </Field>
+          <div style={{display:"flex",gap:14}}>
+            <Field label="Prioritate" style={{flex:1}}><CustomSelect value={form.priority} onChange={v=>setForm(p=>({...p,priority:v}))} options={PRI_OPTS} /></Field>
+            <Field label="Coloană"    style={{flex:1}}><CustomSelect value={form.column}   onChange={v=>setForm(p=>({...p,column:v}))}   options={COL_OPTS} /></Field>
+          </div>
+          <Field label="Deadline (opțional)"><DatePicker value={form.deadline} onChange={v=>setForm(p=>({...p,deadline:v}))} min={today} /></Field>
+        </div>
+        {isEdit && (
+          <div style={{width:360,flexShrink:0,display:"flex",flexDirection:"column"}}>
+            <div style={{padding:"16px 20px 12px",borderBottom:"0.5px solid #e5e7eb",flexShrink:0}}>
+              <span style={{fontSize:10,fontWeight:500,letterSpacing:"0.07em",textTransform:"uppercase",color:"#9ca3af"}}>Activitate</span>
+            </div>
+            <div ref={feedRef} style={{flex:1,overflowY:"auto",padding:"16px 20px",display:"flex",flexDirection:"column"}}>
+              {activity.length===0&&<div style={{fontSize:12,color:"#d1d5db"}}>Nicio activitate.</div>}
+              {activity.map((ev,i)=>(
+                <div key={ev.id} style={{display:"flex",gap:10,paddingBottom:16,position:"relative"}}>
+                  {i<activity.length-1&&<div style={{position:"absolute",left:4.5,top:16,bottom:0,width:0.5,background:"#f3f4f6"}} />}
+                  <div style={{width:10,height:10,borderRadius:"50%",flexShrink:0,marginTop:3,background:evColor(ev.type),border:ev.type==="created"?"0.5px solid #9ca3af":"none"}} />
+                  <div style={{flex:1}}>
+                    {ev.type==="created"    && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>Task creat</div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
+                    {ev.type==="moved"      && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>{ev.from} → <strong style={{color:"#374151"}}>{ev.to}</strong></div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
+                    {ev.type==="archived"   && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>📦 <strong style={{color:"#374151"}}>Arhivat</strong></div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
+                    {ev.type==="unarchived" && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>↩ <strong style={{color:"#374151"}}>Restaurat</strong></div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
+                    {ev.type==="changed"    && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>{ev.field}{ev.from!==null?<span>: <s>{ev.from}</s> → <strong style={{color:"#374151"}}>{ev.to}</strong></span>:<span> <strong style={{color:"#374151"}}>modificat</strong></span>}</div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
+                    {ev.type==="note"       && <><div style={{fontSize:12,color:"#374151",marginBottom:3}}>Notă</div><div style={{background:"#f9fafb",borderLeft:"2px solid #111",padding:"8px 12px",fontSize:12,color:"#374151",lineHeight:1.6,marginBottom:3,wordBreak:"break-word"}}>{renderNote(ev.text)}</div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{padding:"12px 18px 14px",borderTop:"0.5px solid #e5e7eb",flexShrink:0}}>
+              <div style={{display:"flex",gap:2,marginBottom:6}}>
+                {FMT.map((b,i)=><button key={i} onMouseDown={e=>{e.preventDefault();b.action();}} style={{background:"none",border:"0.5px solid #e5e7eb",padding:"3px 9px",cursor:"pointer",color:"#374151",lineHeight:1.4,fontSize:13,minWidth:30,display:"flex",alignItems:"center",justifyContent:"center"}}>{b.label}</button>)}
+              </div>
+              <textarea ref={noteRef} value={note} onChange={e=>setNote(e.target.value)} onKeyDown={handleNKD} placeholder="Adaugă o notă..." rows={3} style={{width:"100%",border:"0.5px solid #d1d5db",padding:"9px 12px",fontSize:12,color:"#111",outline:"none",fontFamily:"inherit",resize:"none",background:"#fff",boxSizing:"border-box",lineHeight:1.5}} />
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:7}}>
+                <span style={{fontSize:10,color:"#d1d5db"}}>Enter trimite · Shift+Enter linie nouă</span>
+                <button onClick={submitNote} style={{background:"#111",color:"#fff",border:"none",padding:"5px 14px",fontSize:12,cursor:"pointer"}}>Adaugă</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+      <ModalFooter onClose={onClose}>
+        <button onClick={onSave} disabled={!valid} style={{...btnPri,opacity:valid?1:0.4,cursor:valid?"pointer":"not-allowed"}}>{isEdit?"Salvează":"Adaugă"}</button>
+      </ModalFooter>
+    </Overlay>
+  );
+}
+
+/* ══ SHARED UI ══ */
+function Overlay({ onClose, title, maxWidth=540, children, noScroll }) {
+  return (
+    <div onClick={e=>{if(e.target===e.currentTarget)onClose();}} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.18)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}}>
+      <div style={{background:"#fff",width:"100%",maxWidth,border:"1px solid #e5e7eb",display:"flex",flexDirection:"column",margin:"0 16px",maxHeight:"95vh",overflowY:noScroll?"hidden":"auto"}}>
+        <div style={{padding:"20px 28px 18px",borderBottom:"1.5px solid #111",display:"flex",alignItems:"baseline",justifyContent:"space-between",flexShrink:0}}>
+          <span style={{fontSize:16,fontWeight:500}}>{title}</span>
+          <button onClick={onClose} style={{background:"none",border:"none",fontSize:18,color:"#9ca3af",cursor:"pointer"}}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+function ModalFooter({ onClose, children }) {
+  return (
+    <div style={{padding:"14px 28px",borderTop:"0.5px solid #e5e7eb",display:"flex",justifyContent:"flex-end",gap:10,flexShrink:0}}>
+      <button onClick={onClose} style={btnCan}>Anulează</button>
+      {children}
+    </div>
+  );
+}
+function Section({ title, children }) {
+  return (
+    <div>
+      <div style={{fontSize:10,fontWeight:500,letterSpacing:"0.08em",textTransform:"uppercase",color:"#9ca3af",marginBottom:12,paddingBottom:8,borderBottom:"0.5px solid #f3f4f6"}}>{title}</div>
+      {children}
+    </div>
+  );
+}
+function Field({ label, children, style }) {
+  return (
+    <div style={style}>
+      <label style={{fontSize:10,fontWeight:500,color:"#9ca3af",display:"block",marginBottom:6,textTransform:"uppercase",letterSpacing:"0.07em"}}>{label}</label>
+      {children}
+    </div>
+  );
+}
+function CustomSelect({ value, onChange, options }) {
+  const [open,setOpen]=useState(false);
+  const ref=useRef(null);
+  const sel=options.find(o=>o.value===value);
+  useEffect(()=>{ const h=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false);}; document.addEventListener("mousedown",h); return()=>document.removeEventListener("mousedown",h); },[]);
+  return (
+    <div ref={ref} style={{position:"relative",userSelect:"none"}}>
+      <div onClick={()=>setOpen(v=>!v)} style={{border:`0.5px solid ${open?"#111":"#d1d5db"}`,padding:"10px 12px",fontSize:13,color:"#111",background:"#fff",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>{sel?.dot&&<span style={{width:8,height:8,borderRadius:"50%",background:sel.dot,flexShrink:0}}/>}{sel?.label}</div>
+        <span style={{fontSize:10,color:"#9ca3af",transform:open?"rotate(180deg)":"none",transition:"transform 0.15s",display:"inline-block"}}>▾</span>
+      </div>
+      {open&&(
+        <div style={{position:"absolute",bottom:"calc(100% + 4px)",left:0,right:0,background:"#fff",border:"0.5px solid #d1d5db",zIndex:100,boxShadow:"0 -4px 16px rgba(0,0,0,0.08)"}}>
+          {options.map(opt=>(
+            <div key={opt.value} onClick={()=>{onChange(opt.value);setOpen(false);}}
+              style={{padding:"10px 12px",fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:8,background:opt.value===value?"#f9fafb":"#fff",borderLeft:opt.value===value?"2px solid #111":"2px solid transparent"}}
+              onMouseEnter={e=>{if(opt.value!==value)e.currentTarget.style.background="#f9fafb";}}
+              onMouseLeave={e=>{if(opt.value!==value)e.currentTarget.style.background="#fff";}}>
+              {opt.dot&&<span style={{width:8,height:8,borderRadius:"50%",background:opt.dot,flexShrink:0}}/>}{opt.label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+function DatePicker({ value, onChange, min }) {
+  const [open,setOpen]=useState(false);
+  const ref=useRef(null);
+  const today=new Date();today.setHours(0,0,0,0);
+  const minDate=min?new Date(min+"T00:00:00"):today;
+  const parsed=value?new Date(value+"T00:00:00"):null;
+  const [vY,setVY]=useState((parsed||today).getFullYear());
+  const [vM,setVM]=useState((parsed||today).getMonth());
+  useEffect(()=>{ const h=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false);}; document.addEventListener("mousedown",h); return()=>document.removeEventListener("mousedown",h); },[]);
+  const MN=["Ian","Feb","Mar","Apr","Mai","Iun","Iul","Aug","Sep","Oct","Nov","Dec"];
+  const firstDay=(new Date(vY,vM,1).getDay()+6)%7;
+  const daysInM=new Date(vY,vM+1,0).getDate();
+  const prevM=()=>{if(vM===0){setVM(11);setVY(y=>y-1);}else setVM(m=>m-1);};
+  const nextM=()=>{if(vM===11){setVM(0);setVY(y=>y+1);}else setVM(m=>m+1);};
+  const toStr=(y,m,d)=>`${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+  const disp=parsed?parsed.toLocaleDateString("ro-RO",{day:"numeric",month:"short",year:"numeric"}):null;
+  return (
+    <div ref={ref} style={{position:"relative",userSelect:"none"}}>
+      <div onClick={()=>setOpen(v=>!v)} style={{border:`0.5px solid ${open?"#111":"#d1d5db"}`,padding:"10px 12px",fontSize:13,color:disp?"#111":"#9ca3af",background:"#fff",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <span>{disp||"Selectează data"}</span>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          {value&&<span onClick={e=>{e.stopPropagation();onChange("");}} style={{fontSize:11,color:"#9ca3af",cursor:"pointer"}}>✕</span>}
+          <span style={{fontSize:13,color:"#9ca3af"}}>📅</span>
+        </div>
+      </div>
+      {open&&(
+        <div style={{position:"absolute",bottom:"calc(100% + 4px)",left:0,background:"#fff",border:"0.5px solid #d1d5db",zIndex:100,padding:12,width:240,boxShadow:"0 -4px 16px rgba(0,0,0,0.08)"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+            <button onClick={prevM} style={{background:"none",border:"none",cursor:"pointer",fontSize:14,color:"#6b7280",padding:"2px 6px"}}>‹</button>
+            <span style={{fontSize:13,fontWeight:500}}>{MN[vM]} {vY}</span>
+            <button onClick={nextM} style={{background:"none",border:"none",cursor:"pointer",fontSize:14,color:"#6b7280",padding:"2px 6px"}}>›</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",marginBottom:4}}>
+            {["L","M","M","J","V","S","D"].map((d,i)=><div key={i} style={{textAlign:"center",fontSize:10,color:"#9ca3af",padding:"2px 0",fontWeight:500}}>{d}</div>)}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:1}}>
+            {Array.from({length:firstDay}).map((_,i)=><div key={"e"+i}/>)}
+            {Array.from({length:daysInM}).map((_,i)=>{
+              const day=i+1,str=toStr(vY,vM,day),dObj=new Date(str+"T00:00:00");
+              const dis=dObj<minDate,isSel=str===value,isT=dObj.getTime()===today.getTime();
+              return(
+                <div key={day} onClick={()=>{if(!dis){onChange(str);setOpen(false);}}}
+                  style={{textAlign:"center",fontSize:12,padding:"5px 2px",cursor:dis?"default":"pointer",color:dis?"#d1d5db":isSel?"#fff":"#374151",background:isSel?"#111":"transparent",fontWeight:isT&&!isSel?600:400,borderBottom:isT&&!isSel?"1.5px solid #111":"1.5px solid transparent"}}
+                  onMouseEnter={e=>{if(!dis&&!isSel)e.currentTarget.style.background="#f3f4f6";}}
+                  onMouseLeave={e=>{if(!dis&&!isSel)e.currentTarget.style.background="transparent";}}>
+                  {day}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ══ STYLE CONSTANTS ══ */
+const btnPri  = {background:"#111",color:"#fff",border:"none",padding:"9px 20px",fontSize:13,fontWeight:500,cursor:"pointer"};
+const btnSec  = {background:"none",color:"#111",border:"0.5px solid #d1d5db",padding:"9px 16px",fontSize:13,cursor:"pointer"};
+const btnCan  = {background:"none",border:"0.5px solid #d1d5db",padding:"9px 16px",fontSize:13,color:"#6b7280",cursor:"pointer"};
+const btnIcon = {background:"none",border:"none",cursor:"pointer",color:"#d1d5db",fontSize:14,padding:"2px 5px"};
+const btnMove = {background:"none",border:"0.5px solid #e5e7eb",padding:"3px 9px",fontSize:11,color:"#9ca3af",cursor:"pointer"};
+const inputSt = {width:"100%",border:"0.5px solid #d1d5db",padding:"10px 12px",fontSize:13,color:"#111",outline:"none",boxSizing:"border-box",background:"#fff",fontFamily:"inherit"};
+const PRI_OPTS = [{value:"low",label:"Low",dot:"#d1d5db"},{value:"medium",label:"Medium",dot:"#f59e0b"},{value:"high",label:"High",dot:"#ef4444"}];
+const COL_OPTS = COLUMNS.map(c=>({value:c.id,label:c.label}));
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

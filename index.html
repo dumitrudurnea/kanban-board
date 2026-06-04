@@ -784,7 +784,7 @@ function SettingsModal({ settings, setSettings, onClose, urgentTasks }) {
     <Overlay onClose={onClose} title="🔔 Setări notificări & profil" maxWidth={520}>
       <div style={{padding:"24px 28px",display:"flex",flexDirection:"column",gap:22,overflowY:"auto",flex:1}}>
         <Section title="Profil personal">
-          <p style={{fontSize:12,color:"#6b7280",marginBottom:14,lineHeight:1.6}}>Salvat local în browser-ul tău. Fiecare coleg configurează separat.</p>
+          <p style={{fontSize:12,color:"#6b7280",marginBottom:14,lineHeight:1.6}}>Salvat local în browser-ul tău.</p>
           <Field label="Numele tău"><input value={local.name} onChange={e=>setLocal(p=>({...p,name:e.target.value}))} placeholder="ex. Dima" style={inputSt} /></Field>
           <div style={{marginTop:14}}>
             <Field label="Email (pentru remindere)">

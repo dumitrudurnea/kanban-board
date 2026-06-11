@@ -224,6 +224,9 @@ function App() {
     if (!text.trim()) return;
     setTasks(t => t.map(x => x.id!==taskId?x:{...x,activity:[...(x.activity||[]),makeEv("note",{text})]}));
   };
+  const deleteNote = (taskId, eventId) => {
+    setTasks(t => t.map(x => x.id!==taskId?x:{...x,activity:(x.activity||[]).filter(e=>e.id!==eventId)}));
+  };
   const del = id => {
     const task = tasks.find(t=>t.id===id); if (!task) return;
     if (toast) clearTimeout(toast.timeoutId);
@@ -344,7 +347,7 @@ function App() {
       </div>
 
       {/* MODALS */}
-      {modal        && <EditModal form={form} setForm={setForm} onSave={save} onClose={()=>setModal(false)} isEdit={!!editing} editingTask={editing?tasks.find(t=>t.id===editing.id):null} onAddNote={addNote} onToggleHold={toggleHold}/>}
+      {modal        && <EditModal form={form} setForm={setForm} onSave={save} onClose={()=>setModal(false)} isEdit={!!editing} editingTask={editing?tasks.find(t=>t.id===editing.id):null} onAddNote={addNote} onDeleteNote={deleteNote} onToggleHold={toggleHold}/>}
       {showExport   && <ExportModal   tasks={activeTasks} onClose={()=>setShowExport(false)}/>}
       {showImport   && <ImportModal   onImport={importTasks} onClose={()=>setShowImport(false)}/>}
       {showSettings && <SettingsModal settings={settings} setSettings={setSettings} onClose={()=>setShowSettings(false)} urgentTasks={activeTasks.filter(t=>t.column!=="done"&&t.deadline&&deadlineStatus(t.deadline)?.urgent)}/>}
@@ -839,15 +842,22 @@ function UrgentBanner({ tasks, settings, onClose, onOpenSettings }) {
 }
 
 /* ══ EDIT MODAL ══ */
-function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddNote, onToggleHold }) {
+function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddNote, onDeleteNote, onToggleHold }) {
   const valid    = form.title.trim();
   const today    = new Date().toISOString().split("T")[0];
   const activity = editingTask?.activity||[];
   const isHold   = !!editingTask?.onHold;
   const [note,setNote]=useState("");
+  const [menuOpen,setMenuOpen]=useState(null);
   const feedRef=useRef(null);
   const noteRef=useRef(null);
   useEffect(()=>{if(feedRef.current)feedRef.current.scrollTop=feedRef.current.scrollHeight;},[activity.length]);
+  useEffect(()=>{
+    if(!menuOpen)return;
+    const h=e=>{if(!e.target.closest('[data-notemenu]'))setMenuOpen(null);};
+    document.addEventListener('mousedown',h);
+    return()=>document.removeEventListener('mousedown',h);
+  },[menuOpen]);
   const submitNote=()=>{if(!note.trim()||!editingTask)return;onAddNote(editingTask.id,note.trim());setNote("");};
   const applyFmt=m=>{
     const ta=noteRef.current;if(!ta)return;
@@ -876,7 +886,7 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
   };
   const evColor=type=>({note:"#111",moved:"#f59e0b",archived:"#6b7280",unarchived:"#3b82f6",created:"#22c55e",hold:"#3b82f6",unhold:"#93c5fd"}[type]||"#f3f4f6");
   return(
-    <Overlay onClose={onClose} title={isEdit?"Editează task":"Task nou"} maxWidth={isEdit?920:540} noScroll>
+          <Overlay onClose={onClose} title={isEdit?"Editează task":"Task nou"} maxWidth={isEdit?1200:580} noScroll>
       <div style={{display:"flex",flex:1,minHeight:0}}>
         <div style={{flex:1,padding:"22px 28px",display:"flex",flexDirection:"column",gap:16,borderRight:isEdit?"0.5px solid #e5e7eb":"none",overflowY:"auto"}}>
           <Field label="Titlu *"><input autoFocus value={form.title} onChange={e=>setForm(p=>({...p,title:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&onSave()} placeholder="Ce trebuie făcut?" style={inputSt}/></Field>
@@ -905,7 +915,7 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
 
         {/* Activity feed */}
         {isEdit&&(
-          <div style={{width:360,flexShrink:0,display:"flex",flexDirection:"column"}}>
+                      <div style={{width:440,flexShrink:0,display:"flex",flexDirection:"column"}}>
             <div style={{padding:"16px 20px 12px",borderBottom:"0.5px solid #e5e7eb",flexShrink:0}}>
               <span style={{fontSize:10,fontWeight:500,letterSpacing:"0.07em",textTransform:"uppercase",color:"#9ca3af"}}>Activitate</span>
             </div>
@@ -923,7 +933,27 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
                     {ev.type==="hold"       && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>⏸ Pus pe <strong style={{color:"#1d4ed8"}}>Hold</strong></div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
                     {ev.type==="unhold"     && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>▶ <strong style={{color:"#374151"}}>Scos de pe Hold</strong></div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
                     {ev.type==="changed"    && <><div style={{fontSize:12,color:"#9ca3af",marginBottom:2}}>{ev.field}{ev.from!==null?<span>: <s>{ev.from}</s> → <strong style={{color:"#374151"}}>{ev.to}</strong></span>:<span> <strong style={{color:"#374151"}}>modificat</strong></span>}</div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
-                    {ev.type==="note"       && <><div style={{fontSize:12,color:"#374151",marginBottom:3}}>Notă</div><div style={{background:"#f9fafb",borderLeft:"2px solid #111",padding:"8px 12px",fontSize:12,color:"#374151",lineHeight:1.6,marginBottom:3,wordBreak:"break-word"}}>{renderNote(ev.text)}</div><div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div></>}
+                    {ev.type==="note" && (
+                      <>
+                        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:3}}>
+                          <div style={{fontSize:12,color:"#374151"}}>Notă</div>
+                          <div style={{position:"relative"}} data-notemenu>
+                            <button onClick={()=>setMenuOpen(menuOpen===ev.id?null:ev.id)}
+                              style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:18,padding:"0 4px",lineHeight:1,letterSpacing:1}}>⋯</button>
+                            {menuOpen===ev.id&&(
+                              <div style={{position:"absolute",right:0,top:"100%",background:"#fff",border:"0.5px solid #e5e7eb",boxShadow:"0 4px 12px rgba(0,0,0,0.1)",zIndex:50,minWidth:130}}>
+                                <button onClick={()=>{onDeleteNote(editingTask.id,ev.id);setMenuOpen(null);}}
+                                  style={{display:"flex",alignItems:"center",gap:7,width:"100%",padding:"8px 12px",background:"none",border:"none",cursor:"pointer",fontSize:12,color:"#ef4444"}}>
+                                  🗑 Șterge notă
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                        <div style={{background:"#f9fafb",borderLeft:"2px solid #111",padding:"8px 12px",fontSize:12,color:"#374151",lineHeight:1.6,marginBottom:3,wordBreak:"break-word"}}>{renderNote(ev.text)}</div>
+                        <div style={{fontSize:11,color:"#9ca3af"}}>{fmtTs(ev.ts)}</div>
+                      </>
+                    )}
                   </div>
                 </div>
               ))}
@@ -952,7 +982,7 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
 function Overlay({ onClose, title, maxWidth=540, children, noScroll }) {
   return(
     <div onClick={e=>{if(e.target===e.currentTarget)onClose();}} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.18)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}}>
-      <div style={{background:"#fff",width:"100%",maxWidth,border:"1px solid #e5e7eb",display:"flex",flexDirection:"column",margin:"0 16px",maxHeight:"95vh",overflowY:noScroll?"hidden":"auto"}}>
+      <div style={{background:"#fff",width:"100%",maxWidth,border:"1px solid #e5e7eb",display:"flex",flexDirection:"column",margin:"0 16px",maxHeight:"97vh",overflowY:noScroll?"hidden":"auto"}}>
         <div style={{padding:"20px 28px 18px",borderBottom:"1.5px solid #111",display:"flex",alignItems:"baseline",justifyContent:"space-between",flexShrink:0}}>
           <span style={{fontSize:16,fontWeight:500}}>{title}</span>
           <button onClick={onClose} style={{background:"none",border:"none",fontSize:18,color:"#9ca3af",cursor:"pointer"}}>✕</button>

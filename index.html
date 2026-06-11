@@ -888,7 +888,7 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
   return(
           <Overlay onClose={onClose} title={isEdit?"Editează task":"Task nou"} maxWidth={isEdit?1200:580} noScroll>
       <div style={{display:"flex",flex:1,minHeight:0}}>
-        <div style={{flex:1,padding:"22px 28px",display:"flex",flexDirection:"column",gap:16,borderRight:isEdit?"0.5px solid #e5e7eb":"none",overflowY:"auto"}}>
+        <div style={{flex:1,padding:"22px 28px",display:"flex",flexDirection:"column",gap:16,borderRight:isEdit?"0.5px solid #e5e7eb":"none",overflowY:"auto",maxWidth:440,flexShrink:0}}>
           <Field label="Titlu *"><input autoFocus value={form.title} onChange={e=>setForm(p=>({...p,title:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&onSave()} placeholder="Ce trebuie făcut?" style={inputSt}/></Field>
           <Field label="Descriere">
             <textarea value={form.description} onChange={e=>setForm(p=>({...p,description:e.target.value}))} placeholder={"Detalii, linkuri...\n\n- [ ] Sub-task 1\n- [ ] Sub-task 2"} rows={6} style={{...inputSt,resize:"vertical",lineHeight:1.5}}/>
@@ -915,7 +915,7 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
 
         {/* Activity feed */}
         {isEdit&&(
-                      <div style={{width:440,flexShrink:0,display:"flex",flexDirection:"column"}}>
+                      <div style={{flex:1,display:"flex",flexDirection:"column"}}>
             <div style={{padding:"16px 20px 12px",borderBottom:"0.5px solid #e5e7eb",flexShrink:0}}>
               <span style={{fontSize:10,fontWeight:500,letterSpacing:"0.07em",textTransform:"uppercase",color:"#9ca3af"}}>Activitate</span>
             </div>

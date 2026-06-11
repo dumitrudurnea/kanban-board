@@ -87,7 +87,26 @@ function parseInline(text) {
   }
   return out;
 }
-const renderNote = text => text ? text.split("\n").map((l,i) => <span key={i}>{i>0&&<br/>}{parseInline(l)}</span>) : null;
+function renderNote(text) {
+  if (!text) return null;
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  return parts.map((part, i) => {
+    const codeMatch = part.match(/^```([\s\S]*)```$/);
+    if (codeMatch) {
+      const code = codeMatch[1].replace(/^\n/,'').replace(/\n$/,'');
+      return (
+        <div key={i} style={{position:"relative",background:"#1e1e2e",borderRadius:3,padding:"10px 44px 10px 14px",margin:"6px 0",fontFamily:"'Consolas','Monaco',monospace",fontSize:11,color:"#cdd6f4",overflowX:"auto",whiteSpace:"pre",lineHeight:1.7}}>
+          <button onMouseDown={e=>{e.preventDefault();navigator.clipboard?.writeText(code).catch(()=>{const ta=document.createElement('textarea');ta.value=code;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);});}}
+            style={{position:"absolute",top:6,right:6,background:"#313244",border:"0.5px solid #45475a",color:"#9ca3af",fontSize:10,padding:"2px 7px",cursor:"pointer",borderRadius:2,lineHeight:1.4}}
+            title="Copiază codul">📋</button>
+          {code}
+        </div>
+      );
+    }
+    if (!part) return null;
+    return <span key={i}>{part.split("\n").map((l,li)=><span key={li}>{li>0&&<br/>}{parseInline(l)}</span>)}</span>;
+  });
+}
 
 /* ── Notifications ── */
 async function requestNotifPermission() {
@@ -836,11 +855,19 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
     const nn=note.substring(0,s)+m+note.substring(s,e2)+m+note.substring(e2);
     setNote(nn);setTimeout(()=>{ta.focus();ta.setSelectionRange(s+m.length,e2+m.length);},0);
   };
+  const applyCodeBlock = () => {
+    const ta=noteRef.current; if(!ta)return;
+    const s=ta.selectionStart, e2=ta.selectionEnd;
+    const sel=note.substring(s,e2);
+    const nn=note.substring(0,s)+"```\n"+sel+"\n```"+note.substring(e2);
+    setNote(nn); setTimeout(()=>{ta.focus();ta.setSelectionRange(s+4,e2+4);},0);
+  };
   const FMT=[
     {label:<strong style={{fontSize:12}}>B</strong>,action:()=>applyFmt("**")},
     {label:<em style={{fontSize:12}}>I</em>,action:()=>applyFmt("*")},
     {label:<s style={{fontSize:12}}>S</s>,action:()=>applyFmt("~~")},
     {label:<code style={{fontSize:11,fontFamily:"monospace"}}>`</code>,action:()=>applyFmt("`")},
+    {label:<span style={{fontSize:10,fontFamily:"monospace",fontWeight:700}}>{"</>"}</span>,action:applyCodeBlock},
   ];
   const handleNKD=e=>{
     if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();submitNote();return;}
@@ -905,7 +932,7 @@ function EditModal({ form, setForm, onSave, onClose, isEdit, editingTask, onAddN
               <div style={{display:"flex",gap:2,marginBottom:6}}>
                 {FMT.map((b,i)=><button key={i} onMouseDown={e=>{e.preventDefault();b.action();}} style={{background:"none",border:"0.5px solid #e5e7eb",padding:"3px 9px",cursor:"pointer",color:"#374151",lineHeight:1.4,fontSize:13,minWidth:30,display:"flex",alignItems:"center",justifyContent:"center"}}>{b.label}</button>)}
               </div>
-              <textarea ref={noteRef} value={note} onChange={e=>setNote(e.target.value)} onKeyDown={handleNKD} placeholder="Adaugă o notă..." rows={3} style={{width:"100%",border:"0.5px solid #d1d5db",padding:"9px 12px",fontSize:12,color:"#111",outline:"none",fontFamily:"inherit",resize:"none",background:"#fff",boxSizing:"border-box",lineHeight:1.5}}/>
+              <textarea ref={noteRef} value={note} onChange={e=>setNote(e.target.value)} onKeyDown={handleNKD} placeholder="Adaugă o notă... Selectează text și apasă </> pentru cod." rows={5} style={{width:"100%",border:"0.5px solid #d1d5db",padding:"9px 12px",fontSize:12,color:"#111",outline:"none",fontFamily:"inherit",resize:"vertical",background:"#fff",boxSizing:"border-box",lineHeight:1.6}}/>
               <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:7}}>
                 <span style={{fontSize:10,color:"#d1d5db"}}>Enter trimite · Shift+Enter linie nouă</span>
                 <button onClick={submitNote} style={{background:"#111",color:"#fff",border:"none",padding:"5px 14px",fontSize:12,cursor:"pointer"}}>Adaugă</button>
